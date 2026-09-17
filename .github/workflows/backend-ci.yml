@@ -62,3 +62,42 @@ jobs:
         run: |
           go mod tidy
           go test -tags=integration ./internal/store -run TestMongoStoreEndToEnd -v
+
+  event-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Start MongoDB and Kafka
+        run: |
+          docker compose up -d mongodb mongo-init kafka
+          for i in {1..30}; do
+            MONGO_OK=0
+            KAFKA_OK=0
+            docker compose exec -T mongodb mongosh --quiet --eval 'rs.status().ok' | grep -q 1 && MONGO_OK=1 || true
+            docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && KAFKA_OK=1 || true
+            if [ "$MONGO_OK" = "1" ] && [ "$KAFKA_OK" = "1" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$MONGO_OK" != "1" ] || [ "$KAFKA_OK" != "1" ]; then
+            docker compose logs mongodb mongo-init kafka
+            exit 1
+          fi
+          docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --if-not-exists \
+            --topic workflow.record.events.integration \
+            --partitions 1 --replication-factor 1
+      - name: Verify Kafka-to-Mongo idempotency
+        working-directory: services/api
+        env:
+          MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0
+          KAFKA_BROKERS: localhost:9092
+        run: |
+          go mod tidy
+          go test -tags=integration ./internal/events -run TestKafkaMongoNotificationIdempotency -v
