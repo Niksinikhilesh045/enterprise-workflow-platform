@@ -1,0 +1,11 @@
+project_name = "enterprise-workflow"
+aws_region   = "ap-south-1"
+image_tag    = "replace-with-image-sha"
+
+# Store values in AWS Secrets Manager separately. Only reference ARNs here.
+mongo_uri_secret_arn      = "arn:aws:secretsmanager:ap-south-1:123456789012:secret:enterprise-workflow/mongo-example"
+kafka_brokers_secret_arn = "arn:aws:secretsmanager:ap-south-1:123456789012:secret:enterprise-workflow/kafka-example"
+auth_secret_arn           = "arn:aws:secretsmanager:ap-south-1:123456789012:secret:enterprise-workflow/auth-example"
+
+api_desired_count    = 2
+worker_desired_count = 1
