@@ -4,14 +4,16 @@ on:
   push:
     paths:
       - "services/api/**"
+      - "docker-compose.yml"
       - ".github/workflows/backend-ci.yml"
   pull_request:
     paths:
       - "services/api/**"
+      - "docker-compose.yml"
       - ".github/workflows/backend-ci.yml"
 
 jobs:
-  test:
+  unit:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -21,6 +23,34 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
-          cache-dependency-path: services/api/go.mod
+          cache: false
+      - run: go mod download
       - run: gofmt -d . | tee /tmp/gofmt.diff && test ! -s /tmp/gofmt.diff
       - run: go test -race ./...
+
+  mongo-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Start MongoDB replica set
+        run: |
+          docker compose up -d mongodb mongo-init
+          for i in {1..30}; do
+            if docker compose exec -T mongodb mongosh --quiet --eval 'rs.status().ok' | grep -q 1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs mongodb mongo-init
+          exit 1
+      - name: Run MongoDB integration tests
+        working-directory: services/api
+        env:
+          MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0
+        run: |
+          go mod download
+          go test -tags=integration ./internal/store -run TestMongoStoreEndToEnd -v
