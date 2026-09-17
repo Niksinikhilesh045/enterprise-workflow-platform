@@ -36,6 +36,7 @@ func newHandler(srv *Server) http.Handler {
 	mux.Handle("POST /api/v1/workflows", srv.authorize([]auth.Role{auth.RoleAdmin, auth.RoleBuilder}, http.HandlerFunc(srv.createWorkflow)))
 	mux.Handle("GET /api/v1/workflows", srv.authorize(allRoles(), http.HandlerFunc(srv.listWorkflows)))
 	mux.Handle("POST /api/v1/records", srv.authorize([]auth.Role{auth.RoleAdmin, auth.RoleBuilder, auth.RoleRequester}, http.HandlerFunc(srv.createRecord)))
+	mux.Handle("GET /api/v1/records", srv.authorize(allRoles(), http.HandlerFunc(srv.listRecords)))
 	mux.Handle("GET /api/v1/records/{id}", srv.authorize(allRoles(), http.HandlerFunc(srv.getRecord)))
 	mux.Handle("PUT /api/v1/records/{id}", srv.authorize([]auth.Role{auth.RoleAdmin, auth.RoleApprover}, http.HandlerFunc(srv.updateRecord)))
 	mux.Handle("GET /api/v1/audit-events", srv.authorize([]auth.Role{auth.RoleAdmin, auth.RoleAuditor}, http.HandlerFunc(srv.listAudit)))
@@ -143,6 +144,21 @@ func (s *Server) createRecord(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) listRecords(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := tenantID(r)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "tenant is required")
+		return
+	}
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	items, err := s.store.ListRecords(tenant, state)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "unable to list records")
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (s *Server) getRecord(w http.ResponseWriter, r *http.Request) {
