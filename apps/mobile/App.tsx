@@ -180,7 +180,7 @@ export default function App() {
             </TouchableOpacity>
           </View>
         )}
-        ListEmptyComponent={!loading ? <Text style={s.empty}>Refresh to load submitted requests for this tenant.</Text> : null}
+        ListEmptyComponent={!loading ? <Text style={s.empty}>Refresh to load submitted requests for this tenant.</Text> : <View />}
       />
     </SafeAreaView>
   );
