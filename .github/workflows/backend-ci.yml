@@ -80,12 +80,19 @@ jobs:
             docker compose exec -T mongodb mongosh --quiet --eval 'rs.status().ok' | grep -q 1 && MONGO_OK=1 || true
             docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && KAFKA_OK=1 || true
             if [ "$MONGO_OK" = "1" ] && [ "$KAFKA_OK" = "1" ]; then
-              exit 0
+              break
             fi
             sleep 2
           done
-          docker compose logs mongodb mongo-init kafka
-          exit 1
+          if [ "$MONGO_OK" != "1" ] || [ "$KAFKA_OK" != "1" ]; then
+            docker compose logs mongodb mongo-init kafka
+            exit 1
+          fi
+          docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 \
+            --create --if-not-exists \
+            --topic workflow.record.events.integration \
+            --partitions 1 --replication-factor 1
       - name: Verify Kafka-to-Mongo idempotency
         working-directory: services/api
         env:
