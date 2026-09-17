@@ -107,3 +107,56 @@ func TestDrainOutboxStopsAfterBatchWithPublishError(t *testing.T) {
 		t.Fatalf("expected exactly one batch to be attempted after failure, got %d publish calls", publisher.calls)
 	}
 }
+
+
+type fakeBatchPublisher struct {
+	batches int
+	events  int
+}
+
+func (p *fakeBatchPublisher) Publish(_ context.Context, _ domain.OutboxEvent) error {
+	return errors.New("sequential publish should not be used")
+}
+
+func (p *fakeBatchPublisher) PublishBatch(_ context.Context, batch []domain.OutboxEvent) error {
+	p.batches++
+	p.events += len(batch)
+	return nil
+}
+
+func (p *fakeBatchPublisher) Close() error { return nil }
+
+type fakeBatchOutboxStore struct {
+	*fakeOutboxStore
+	batchUpdates int
+}
+
+func (s *fakeBatchOutboxStore) MarkOutboxPublishedBatch(_ context.Context, ids []string) error {
+	s.batchUpdates++
+	for _, id := range ids {
+		s.published[id] = true
+	}
+	return nil
+}
+
+func TestDrainOutboxUsesBatchIOWhenAvailable(t *testing.T) {
+	outbox := &fakeBatchOutboxStore{fakeOutboxStore: newFakeOutboxStore(725)}
+	publisher := &fakeBatchPublisher{}
+
+	count, err := drainOutbox(context.Background(), outbox, publisher, 250)
+	if err != nil {
+		t.Fatalf("drainOutbox returned error: %v", err)
+	}
+	if count != 725 {
+		t.Fatalf("expected 725 published events, got %d", count)
+	}
+	if publisher.batches != 3 {
+		t.Fatalf("expected 3 Kafka batch writes, got %d", publisher.batches)
+	}
+	if publisher.events != 725 {
+		t.Fatalf("expected 725 events in batch writes, got %d", publisher.events)
+	}
+	if outbox.batchUpdates != 3 {
+		t.Fatalf("expected 3 Mongo batch updates, got %d", outbox.batchUpdates)
+	}
+}

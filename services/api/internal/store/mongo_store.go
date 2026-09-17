@@ -250,6 +250,18 @@ func (s *MongoStore) MarkOutboxPublished(ctx context.Context, id string) error {
 	return err
 }
 
+func (s *MongoStore) MarkOutboxPublishedBatch(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.outbox.UpdateMany(
+		ctx,
+		bson.M{"_id": bson.M{"$in": ids}},
+		bson.M{"$set": bson.M{"publishedAt": time.Now().UTC(), "lastError": ""}},
+	)
+	return err
+}
+
 func (s *MongoStore) MarkOutboxFailed(ctx context.Context, id, reason string) error {
 	_, err := s.outbox.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$inc": bson.M{"attempts": 1}, "$set": bson.M{"lastError": reason}})
 	return err
