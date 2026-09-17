@@ -1,16 +1,44 @@
 name: frontend-ci
+
 on:
   push:
-    paths: ["apps/web/**", "apps/mobile/**", ".github/workflows/frontend-ci.yml"]
+    paths:
+      - "apps/web/**"
+      - "apps/mobile/**"
+      - ".github/workflows/frontend-ci.yml"
   pull_request:
-    paths: ["apps/web/**", "apps/mobile/**", ".github/workflows/frontend-ci.yml"]
+    paths:
+      - "apps/web/**"
+      - "apps/mobile/**"
+      - ".github/workflows/frontend-ci.yml"
+
 jobs:
   web-build:
     runs-on: ubuntu-latest
-    defaults: {run: {working-directory: apps/web}}
+    defaults:
+      run:
+        working-directory: apps/web
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: {node-version: "22", cache: "npm", cache-dependency-path: apps/web/package.json}
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/web/package.json
       - run: npm install
       - run: npm run build
+
+  mobile-typecheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/mobile/package.json
+      - run: npm install
+      - run: npm run typecheck
