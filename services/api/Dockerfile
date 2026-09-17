@@ -22,4 +22,4 @@ COPY --from=build /out/token /app/token
 
 USER app
 EXPOSE 8080
-ENTRYPOINT ["/app/api"]
+CMD ["/app/api"]
