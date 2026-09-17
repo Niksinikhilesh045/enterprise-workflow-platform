@@ -49,7 +49,7 @@ func TestKafkaMongoNotificationIdempotency(t *testing.T) {
 	}
 	defer publisher.Close()
 
-	topic := fmt.Sprintf("workflow.record.events.integration.%d", time.Now().UnixNano())
+	const topic = "workflow.record.events.integration"
 	sink := &countingNotificationSink{store: mongoStore}
 	handler := NewNotificationHandler(sink)
 	consumer, err := NewKafkaConsumer(brokers, "integration-consumer-"+fmt.Sprint(time.Now().UnixNano()), topic, handler, publisher)
