@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +15,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/segmentio/kafka-go"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type workflowResponse struct {
@@ -25,6 +32,24 @@ type requestResult struct {
 	Err      error
 }
 
+type pipelineSnapshot struct {
+	Records       int64
+	Unpublished   int64
+	Notifications int64
+	KafkaLag      int64
+}
+
+type pipelineProbe struct {
+	mongoClient   *mongo.Client
+	records       *mongo.Collection
+	outbox        *mongo.Collection
+	notifications *mongo.Collection
+	kafkaClient   *kafka.Client
+	topic         string
+	groupID       string
+	partitions    []int
+}
+
 func main() {
 	baseURL := flag.String("base-url", "http://localhost:8080", "API base URL")
 	token := flag.String("token", "", "bearer token with permission to create workflows and records")
@@ -32,6 +57,15 @@ func main() {
 	requests := flag.Int("requests", 1000, "number of record-create requests")
 	concurrency := flag.Int("concurrency", 20, "number of concurrent workers")
 	timeout := flag.Duration("timeout", 15*time.Second, "per-request timeout")
+
+	waitForPipeline := flag.Bool("wait-for-pipeline", false, "measure end-to-end completion through outbox, Kafka, and notification projection")
+	pipelineTimeout := flag.Duration("pipeline-timeout", 45*time.Second, "maximum time to wait for the asynchronous pipeline")
+	pipelinePoll := flag.Duration("pipeline-poll", 100*time.Millisecond, "poll interval while waiting for the asynchronous pipeline")
+	mongoURI := flag.String("mongo-uri", envOr("MONGO_URI", "mongodb://localhost:27017/?replicaSet=rs0"), "MongoDB URI used by pipeline benchmark mode")
+	mongoDB := flag.String("mongo-db", envOr("MONGO_DB", "enterprise_workflow"), "MongoDB database used by pipeline benchmark mode")
+	kafkaBrokers := flag.String("kafka-brokers", envOr("KAFKA_BROKERS", "localhost:9092"), "comma-separated Kafka brokers used by pipeline benchmark mode")
+	kafkaTopic := flag.String("kafka-topic", "workflow.record-events", "Kafka topic used by pipeline benchmark mode")
+	consumerGroup := flag.String("consumer-group", "workflow-notifications-v1", "Kafka consumer group used by pipeline benchmark mode")
 	flag.Parse()
 
 	if strings.TrimSpace(*token) == "" {
@@ -42,6 +76,12 @@ func main() {
 	}
 	if *concurrency <= 0 {
 		log.Fatal("-concurrency must be greater than zero")
+	}
+	if *pipelineTimeout <= 0 {
+		log.Fatal("-pipeline-timeout must be greater than zero")
+	}
+	if *pipelinePoll <= 0 {
+		log.Fatal("-pipeline-poll must be greater than zero")
 	}
 
 	client := &http.Client{Timeout: *timeout}
@@ -54,6 +94,25 @@ func main() {
 			log.Fatalf("create workflow: %v", err)
 		}
 		fmt.Printf("created load-test workflow: %s\n", wfID)
+	}
+
+	var probe *pipelineProbe
+	var baseline pipelineSnapshot
+	if *waitForPipeline {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var err error
+		probe, err = newPipelineProbe(ctx, *mongoURI, *mongoDB, *kafkaBrokers, *kafkaTopic, *consumerGroup)
+		if err == nil {
+			baseline, err = probe.Snapshot(ctx, wfID)
+		}
+		cancel()
+		if err != nil {
+			if probe != nil {
+				_ = probe.Close(context.Background())
+			}
+			log.Fatalf("initialize pipeline benchmark: %v", err)
+		}
+		defer probe.Close(context.Background())
 	}
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -102,27 +161,307 @@ func main() {
 			failed++
 		}
 	}
-	elapsed := time.Since(started)
+	apiElapsed := time.Since(started)
 
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	throughput := float64(*requests) / elapsed.Seconds()
+	throughput := float64(*requests) / apiElapsed.Seconds()
 
 	fmt.Println("\nLoad test results")
-	fmt.Printf("requests:     %d\n", *requests)
-	fmt.Printf("concurrency:  %d\n", workerCount)
-	fmt.Printf("successful:   %d\n", successful)
-	fmt.Printf("failed:       %d\n", failed)
-	fmt.Printf("elapsed:      %s\n", elapsed.Round(time.Millisecond))
-	fmt.Printf("throughput:   %.2f req/s\n", throughput)
-	fmt.Printf("latency p50:  %s\n", percentile(latencies, 0.50).Round(time.Microsecond))
-	fmt.Printf("latency p95:  %s\n", percentile(latencies, 0.95).Round(time.Microsecond))
-	fmt.Printf("latency p99:  %s\n", percentile(latencies, 0.99).Round(time.Microsecond))
-	fmt.Printf("latency max:  %s\n", maxDuration(latencies).Round(time.Microsecond))
-	fmt.Printf("status codes: %v\n", statusCounts)
+	fmt.Printf("workflow id:   %s\n", wfID)
+	fmt.Printf("requests:      %d\n", *requests)
+	fmt.Printf("concurrency:   %d\n", workerCount)
+	fmt.Printf("successful:    %d\n", successful)
+	fmt.Printf("failed:        %d\n", failed)
+	fmt.Printf("elapsed:       %s\n", apiElapsed.Round(time.Millisecond))
+	fmt.Printf("throughput:    %.2f req/s\n", throughput)
+	fmt.Printf("latency p50:   %s\n", percentile(latencies, 0.50).Round(time.Microsecond))
+	fmt.Printf("latency p95:   %s\n", percentile(latencies, 0.95).Round(time.Microsecond))
+	fmt.Printf("latency p99:   %s\n", percentile(latencies, 0.99).Round(time.Microsecond))
+	fmt.Printf("latency max:   %s\n", maxDuration(latencies).Round(time.Microsecond))
+	fmt.Printf("status codes:  %v\n", statusCounts)
 
 	if failed > 0 {
 		os.Exit(1)
 	}
+
+	if *waitForPipeline {
+		ctx, cancel := context.WithTimeout(context.Background(), *pipelineTimeout)
+		finalSnapshot, endToEndElapsed, err := waitUntilPipelineComplete(
+			ctx,
+			probe,
+			wfID,
+			baseline,
+			int64(successful),
+			started,
+			*pipelinePoll,
+		)
+		cancel()
+
+		postHTTPDrain := endToEndElapsed - apiElapsed
+		if postHTTPDrain < 0 {
+			postHTTPDrain = 0
+		}
+
+		fmt.Println("\nEnd-to-end pipeline results")
+		fmt.Printf("records:        %d/%d\n", finalSnapshot.Records-baseline.Records, successful)
+		fmt.Printf("unpublished:    %d\n", finalSnapshot.Unpublished)
+		fmt.Printf("notifications:  %d/%d\n", finalSnapshot.Notifications-baseline.Notifications, successful)
+		fmt.Printf("kafka lag:      %d\n", finalSnapshot.KafkaLag)
+		fmt.Printf("post-http drain:%s\n", formatAlignedDuration(postHTTPDrain))
+		fmt.Printf("end-to-end:     %s\n", endToEndElapsed.Round(time.Millisecond))
+		if endToEndElapsed > 0 {
+			fmt.Printf("e2e throughput: %.2f records/s\n", float64(successful)/endToEndElapsed.Seconds())
+		}
+
+		if err != nil {
+			log.Printf("pipeline benchmark incomplete: %v", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func newPipelineProbe(ctx context.Context, mongoURI, database, brokersValue, topic, groupID string) (*pipelineProbe, error) {
+	if strings.TrimSpace(mongoURI) == "" {
+		return nil, errors.New("MongoDB URI is required")
+	}
+	if strings.TrimSpace(database) == "" {
+		return nil, errors.New("MongoDB database is required")
+	}
+	if strings.TrimSpace(topic) == "" {
+		return nil, errors.New("Kafka topic is required")
+	}
+	if strings.TrimSpace(groupID) == "" {
+		return nil, errors.New("Kafka consumer group is required")
+	}
+
+	brokers := splitCSV(brokersValue)
+	if len(brokers) == 0 {
+		return nil, errors.New("at least one Kafka broker is required")
+	}
+
+	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	if err != nil {
+		return nil, fmt.Errorf("connect MongoDB: %w", err)
+	}
+	if err := mongoClient.Ping(ctx, nil); err != nil {
+		_ = mongoClient.Disconnect(context.Background())
+		return nil, fmt.Errorf("ping MongoDB: %w", err)
+	}
+
+	partitions, err := kafka.LookupPartitions(ctx, "tcp", brokers[0], topic)
+	if err != nil {
+		_ = mongoClient.Disconnect(context.Background())
+		return nil, fmt.Errorf("lookup Kafka partitions: %w", err)
+	}
+	partitionIDs := make([]int, 0, len(partitions))
+	for _, partition := range partitions {
+		if partition.Error != nil {
+			_ = mongoClient.Disconnect(context.Background())
+			return nil, fmt.Errorf("Kafka partition %d metadata: %w", partition.ID, partition.Error)
+		}
+		partitionIDs = append(partitionIDs, partition.ID)
+	}
+	sort.Ints(partitionIDs)
+	if len(partitionIDs) == 0 {
+		_ = mongoClient.Disconnect(context.Background())
+		return nil, fmt.Errorf("Kafka topic %q has no partitions", topic)
+	}
+
+	db := mongoClient.Database(database)
+	return &pipelineProbe{
+		mongoClient:   mongoClient,
+		records:       db.Collection("records"),
+		outbox:        db.Collection("outbox_events"),
+		notifications: db.Collection("notifications"),
+		kafkaClient: &kafka.Client{
+			Addr:    kafka.TCP(brokers...),
+			Timeout: 5 * time.Second,
+		},
+		topic:      topic,
+		groupID:    groupID,
+		partitions: partitionIDs,
+	}, nil
+}
+
+func (p *pipelineProbe) Close(ctx context.Context) error {
+	if p == nil || p.mongoClient == nil {
+		return nil
+	}
+	return p.mongoClient.Disconnect(ctx)
+}
+
+func (p *pipelineProbe) Snapshot(ctx context.Context, workflowID string) (pipelineSnapshot, error) {
+	records, err := p.records.CountDocuments(ctx, bson.M{"workflowId": workflowID})
+	if err != nil {
+		return pipelineSnapshot{}, fmt.Errorf("count records: %w", err)
+	}
+
+	unpublished, err := p.outbox.CountDocuments(ctx, bson.M{
+		"payload.workflowId": workflowID,
+		"type":               "record.created",
+		"publishedAt":        bson.M{"$exists": false},
+	})
+	if err != nil {
+		return pipelineSnapshot{}, fmt.Errorf("count unpublished outbox events: %w", err)
+	}
+
+	notifications, err := p.countNotificationsForWorkflow(ctx, workflowID)
+	if err != nil {
+		return pipelineSnapshot{}, err
+	}
+
+	lag, err := p.kafkaLag(ctx)
+	if err != nil {
+		return pipelineSnapshot{}, err
+	}
+
+	return pipelineSnapshot{
+		Records:       records,
+		Unpublished:   unpublished,
+		Notifications: notifications,
+		KafkaLag:      lag,
+	}, nil
+}
+
+func (p *pipelineProbe) countNotificationsForWorkflow(ctx context.Context, workflowID string) (int64, error) {
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.D{{Key: "workflowId", Value: workflowID}}}},
+		bson.D{{Key: "$lookup", Value: bson.D{
+			{Key: "from", Value: "notifications"},
+			{Key: "localField", Value: "_id"},
+			{Key: "foreignField", Value: "recordId"},
+			{Key: "as", Value: "notifications"},
+		}}},
+		bson.D{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "count", Value: bson.D{{Key: "$sum", Value: bson.D{{Key: "$size", Value: "$notifications"}}}}},
+		}}},
+	}
+
+	cursor, err := p.records.Aggregate(ctx, pipeline)
+	if err != nil {
+		return 0, fmt.Errorf("aggregate notifications: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var rows []struct {
+		Count int64 `bson:"count"`
+	}
+	if err := cursor.All(ctx, &rows); err != nil {
+		return 0, fmt.Errorf("decode notification aggregate: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Count, nil
+}
+
+func (p *pipelineProbe) kafkaLag(ctx context.Context) (int64, error) {
+	offsetRequests := make([]kafka.OffsetRequest, 0, len(p.partitions))
+	for _, partition := range p.partitions {
+		offsetRequests = append(offsetRequests, kafka.LastOffsetOf(partition))
+	}
+	endOffsetsResponse, err := p.kafkaClient.ListOffsets(ctx, &kafka.ListOffsetsRequest{
+		Topics: map[string][]kafka.OffsetRequest{p.topic: offsetRequests},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("list Kafka end offsets: %w", err)
+	}
+
+	endOffsets := make(map[int]int64, len(p.partitions))
+	for _, partition := range endOffsetsResponse.Topics[p.topic] {
+		if partition.Error != nil {
+			return 0, fmt.Errorf("Kafka end offset partition %d: %w", partition.Partition, partition.Error)
+		}
+		endOffsets[partition.Partition] = partition.LastOffset
+	}
+
+	committedResponse, err := p.kafkaClient.OffsetFetch(ctx, &kafka.OffsetFetchRequest{
+		GroupID: p.groupID,
+		Topics:  map[string][]int{p.topic: p.partitions},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("fetch Kafka committed offsets: %w", err)
+	}
+	if committedResponse.Error != nil {
+		return 0, fmt.Errorf("fetch Kafka committed offsets: %w", committedResponse.Error)
+	}
+
+	committedOffsets := make(map[int]int64, len(p.partitions))
+	for _, partition := range committedResponse.Topics[p.topic] {
+		if partition.Error != nil {
+			return 0, fmt.Errorf("Kafka committed offset partition %d: %w", partition.Partition, partition.Error)
+		}
+		committedOffsets[partition.Partition] = partition.CommittedOffset
+	}
+
+	for _, partition := range p.partitions {
+		if _, ok := endOffsets[partition]; !ok {
+			return 0, fmt.Errorf("missing Kafka end offset for partition %d", partition)
+		}
+	}
+
+	return calculateKafkaLag(endOffsets, committedOffsets), nil
+}
+
+func calculateKafkaLag(endOffsets, committedOffsets map[int]int64) int64 {
+	var lag int64
+	for partition, endOffset := range endOffsets {
+		committedOffset := committedOffsets[partition]
+		if committedOffset < 0 {
+			committedOffset = 0
+		}
+		if endOffset > committedOffset {
+			lag += endOffset - committedOffset
+		}
+	}
+	return lag
+}
+
+func waitUntilPipelineComplete(
+	ctx context.Context,
+	probe *pipelineProbe,
+	workflowID string,
+	baseline pipelineSnapshot,
+	expected int64,
+	started time.Time,
+	pollInterval time.Duration,
+) (pipelineSnapshot, time.Duration, error) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	var latest pipelineSnapshot
+	for {
+		snapshot, err := probe.Snapshot(ctx, workflowID)
+		if err != nil {
+			return latest, time.Since(started), err
+		}
+		latest = snapshot
+		if pipelineComplete(snapshot, baseline, expected) {
+			return snapshot, time.Since(started), nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return latest, time.Since(started), fmt.Errorf(
+				"timed out waiting for pipeline: records=%d/%d unpublished=%d notifications=%d/%d kafkaLag=%d",
+				latest.Records-baseline.Records,
+				expected,
+				latest.Unpublished,
+				latest.Notifications-baseline.Notifications,
+				expected,
+				latest.KafkaLag,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func pipelineComplete(snapshot, baseline pipelineSnapshot, expected int64) bool {
+	return snapshot.Records-baseline.Records >= expected &&
+		snapshot.Unpublished == 0 &&
+		snapshot.Notifications-baseline.Notifications >= expected &&
+		snapshot.KafkaLag == 0
 }
 
 func createWorkflow(client *http.Client, baseURL, token string) (string, error) {
@@ -215,4 +554,30 @@ func maxDuration(values []time.Duration) time.Duration {
 		return 0
 	}
 	return values[len(values)-1]
+}
+
+func splitCSV(value string) []string {
+	items := strings.Split(value, ",")
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func envOr(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func formatAlignedDuration(value time.Duration) string {
+	text := value.Round(time.Millisecond).String()
+	if len(text) >= 5 {
+		return " " + text
+	}
+	return strings.Repeat(" ", 6-len(text)) + text
 }

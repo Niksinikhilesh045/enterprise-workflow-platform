@@ -293,7 +293,44 @@ go run ./cmd/loadtest `
 
 Record the complete output. This is the run we can use to derive a defensible resume performance statement if it remains stable.
 
-## 14. Verify the React web client
+## 14. Measure end-to-end pipeline completion
+
+After the API, outbox relay, and event worker are running, use pipeline benchmark mode to keep timing after the HTTP load finishes until the matching workflow has:
+
+- all records persisted,
+- zero unpublished outbox events,
+- all notification projections written,
+- zero lag for the notification consumer group.
+
+From `services/api`:
+
+```powershell
+go run ./cmd/loadtest `
+    -token $ADMIN_TOKEN `
+    -requests 5000 `
+    -concurrency 50 `
+    -wait-for-pipeline `
+    -pipeline-timeout 45s
+```
+
+The command prints the normal HTTP metrics plus:
+
+```text
+End-to-end pipeline results
+records:        5000/5000
+unpublished:    0
+notifications:  5000/5000
+kafka lag:      0
+post-http drain: ...
+end-to-end:      ...
+e2e throughput:  ... records/s
+```
+
+`end-to-end` starts when the record workload starts and stops only after the full asynchronous completion criteria are observed. `post-http drain` isolates the time between the final HTTP response and full pipeline catch-up.
+
+The benchmark defaults to the local `MONGO_URI`, `MONGO_DB`, `KAFKA_BROKERS`, topic `workflow.record-events`, and consumer group `workflow-notifications-v1`. Override them with flags when testing a different environment.
+
+## 15. Verify the React web client
 
 From the repository root in another terminal:
 
@@ -306,7 +343,7 @@ npm run dev
 
 Open the local Vite URL shown in the terminal, paste the relevant bearer token, and verify workflow creation and request submission.
 
-## 15. Verify the React Native client
+## 16. Verify the React Native client
 
 From another terminal:
 
@@ -326,7 +363,7 @@ Validate that the approval inbox:
 3. removes the approved request from the submitted inbox,
 4. reports a version conflict if a stale record version is used.
 
-## 16. Stop local infrastructure
+## 17. Stop local infrastructure
 
 When testing is complete:
 
