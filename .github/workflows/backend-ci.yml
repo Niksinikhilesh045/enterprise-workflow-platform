@@ -78,7 +78,7 @@ jobs:
             MONGO_OK=0
             KAFKA_OK=0
             docker compose exec -T mongodb mongosh --quiet --eval 'rs.status().ok' | grep -q 1 && MONGO_OK=1 || true
-            docker compose exec -T kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && KAFKA_OK=1 || true
+            docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && KAFKA_OK=1 || true
             if [ "$MONGO_OK" = "1" ] && [ "$KAFKA_OK" = "1" ]; then
               exit 0
             fi
