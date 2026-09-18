@@ -39,6 +39,14 @@ type pipelineSnapshot struct {
 	KafkaLag      int64
 }
 
+type pipelineMilestones struct {
+	HTTPComplete          time.Duration
+	OutboxPublished       time.Duration
+	KafkaCaughtUp         time.Duration
+	NotificationsComplete time.Duration
+	EndToEnd              time.Duration
+}
+
 type pipelineProbe struct {
 	mongoClient   *mongo.Client
 	records       *mongo.Collection
@@ -186,18 +194,19 @@ func main() {
 
 	if *waitForPipeline {
 		ctx, cancel := context.WithTimeout(context.Background(), *pipelineTimeout)
-		finalSnapshot, endToEndElapsed, err := waitUntilPipelineComplete(
+		finalSnapshot, milestones, err := waitUntilPipelineComplete(
 			ctx,
 			probe,
 			wfID,
 			baseline,
 			int64(successful),
 			started,
+			apiElapsed,
 			*pipelinePoll,
 		)
 		cancel()
 
-		postHTTPDrain := endToEndElapsed - apiElapsed
+		postHTTPDrain := milestones.EndToEnd - milestones.HTTPComplete
 		if postHTTPDrain < 0 {
 			postHTTPDrain = 0
 		}
@@ -208,10 +217,26 @@ func main() {
 		fmt.Printf("notifications:  %d/%d\n", finalSnapshot.Notifications-baseline.Notifications, successful)
 		fmt.Printf("kafka lag:      %d\n", finalSnapshot.KafkaLag)
 		fmt.Printf("post-http drain:%s\n", formatAlignedDuration(postHTTPDrain))
-		fmt.Printf("end-to-end:     %s\n", endToEndElapsed.Round(time.Millisecond))
-		if endToEndElapsed > 0 {
-			fmt.Printf("e2e throughput: %.2f records/s\n", float64(successful)/endToEndElapsed.Seconds())
+		fmt.Printf("end-to-end:     %s\n", milestones.EndToEnd.Round(time.Millisecond))
+		if milestones.EndToEnd > 0 {
+			fmt.Printf("e2e throughput: %.2f records/s\n", float64(successful)/milestones.EndToEnd.Seconds())
 		}
+
+		fmt.Println("\nPipeline stage timings")
+		fmt.Printf("http complete:          %s\n", milestones.HTTPComplete.Round(time.Millisecond))
+		fmt.Printf("outbox fully published: %s (%s after HTTP)\n",
+			milestones.OutboxPublished.Round(time.Millisecond),
+			stageDelta(milestones.OutboxPublished, milestones.HTTPComplete),
+		)
+		fmt.Printf("kafka lag reached zero: %s (%s after outbox)\n",
+			milestones.KafkaCaughtUp.Round(time.Millisecond),
+			stageDelta(milestones.KafkaCaughtUp, milestones.OutboxPublished),
+		)
+		fmt.Printf("notifications complete: %s (%s after HTTP)\n",
+			milestones.NotificationsComplete.Round(time.Millisecond),
+			stageDelta(milestones.NotificationsComplete, milestones.HTTPComplete),
+		)
+		fmt.Printf("pipeline complete:      %s\n", milestones.EndToEnd.Round(time.Millisecond))
 
 		if err != nil {
 			log.Printf("pipeline benchmark incomplete: %v", err)
@@ -428,22 +453,43 @@ func waitUntilPipelineComplete(
 	baseline pipelineSnapshot,
 	expected int64,
 	started time.Time,
+	httpElapsed time.Duration,
 	pollInterval time.Duration,
-) (pipelineSnapshot, time.Duration, error) {
+) (pipelineSnapshot, pipelineMilestones, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	milestones := pipelineMilestones{HTTPComplete: httpElapsed}
 	var latest pipelineSnapshot
 	var lastProbeErr error
+
 	for {
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		snapshot, err := probe.Snapshot(probeCtx, workflowID)
 		cancel()
+
 		if err == nil {
 			latest = snapshot
 			lastProbeErr = nil
+			elapsed := time.Since(started)
+			recordsComplete := snapshot.Records-baseline.Records >= expected
+			notificationsComplete := snapshot.Notifications-baseline.Notifications >= expected
+
+			if milestones.OutboxPublished == 0 && recordsComplete && snapshot.Unpublished == 0 {
+				milestones.OutboxPublished = elapsed
+			}
+			if milestones.NotificationsComplete == 0 && notificationsComplete {
+				milestones.NotificationsComplete = elapsed
+			}
+			if milestones.KafkaCaughtUp == 0 &&
+				milestones.OutboxPublished > 0 &&
+				snapshot.KafkaLag == 0 {
+				milestones.KafkaCaughtUp = elapsed
+			}
+
 			if pipelineComplete(snapshot, baseline, expected) {
-				return snapshot, time.Since(started), nil
+				milestones.EndToEnd = elapsed
+				return snapshot, milestones, nil
 			}
 		} else {
 			lastProbeErr = err
@@ -451,6 +497,7 @@ func waitUntilPipelineComplete(
 
 		select {
 		case <-ctx.Done():
+			milestones.EndToEnd = time.Since(started)
 			message := fmt.Sprintf(
 				"timed out waiting for pipeline: records=%d/%d unpublished=%d notifications=%d/%d kafkaLag=%d",
 				latest.Records-baseline.Records,
@@ -463,7 +510,7 @@ func waitUntilPipelineComplete(
 			if lastProbeErr != nil {
 				message += fmt.Sprintf(" lastProbeError=%v", lastProbeErr)
 			}
-			return latest, time.Since(started), errors.New(message)
+			return latest, milestones, errors.New(message)
 		case <-ticker.C:
 		}
 	}
@@ -584,6 +631,17 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func stageDelta(later, earlier time.Duration) string {
+	if later <= 0 {
+		return "not observed"
+	}
+	delta := later - earlier
+	if delta < 0 {
+		delta = 0
+	}
+	return delta.Round(time.Millisecond).String()
 }
 
 func formatAlignedDuration(value time.Duration) string {
