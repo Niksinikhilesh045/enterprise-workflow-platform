@@ -324,36 +324,39 @@ func (p *pipelineProbe) Snapshot(ctx context.Context, workflowID string) (pipeli
 }
 
 func (p *pipelineProbe) countNotificationsForWorkflow(ctx context.Context, workflowID string) (int64, error) {
-	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$match", Value: bson.D{{Key: "workflowId", Value: workflowID}}}},
-		bson.D{{Key: "$lookup", Value: bson.D{
-			{Key: "from", Value: "notifications"},
-			{Key: "localField", Value: "_id"},
-			{Key: "foreignField", Value: "recordId"},
-			{Key: "as", Value: "notifications"},
-		}}},
-		bson.D{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: nil},
-			{Key: "count", Value: bson.D{{Key: "$sum", Value: bson.D{{Key: "$size", Value: "$notifications"}}}}},
-		}}},
-	}
-
-	cursor, err := p.records.Aggregate(ctx, pipeline)
+	cursor, err := p.outbox.Find(
+		ctx,
+		bson.M{
+			"payload.workflowId": workflowID,
+			"type":               "record.created",
+		},
+		options.Find().SetProjection(bson.M{"_id": 1}),
+	)
 	if err != nil {
-		return 0, fmt.Errorf("aggregate notifications: %w", err)
+		return 0, fmt.Errorf("list workflow outbox ids: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var rows []struct {
-		Count int64 `bson:"count"`
+	var outboxRows []struct {
+		ID string `bson:"_id"`
 	}
-	if err := cursor.All(ctx, &rows); err != nil {
-		return 0, fmt.Errorf("decode notification aggregate: %w", err)
+	if err := cursor.All(ctx, &outboxRows); err != nil {
+		return 0, fmt.Errorf("decode workflow outbox ids: %w", err)
 	}
-	if len(rows) == 0 {
+	if len(outboxRows) == 0 {
 		return 0, nil
 	}
-	return rows[0].Count, nil
+
+	ids := make([]string, 0, len(outboxRows))
+	for _, row := range outboxRows {
+		ids = append(ids, row.ID)
+	}
+
+	count, err := p.notifications.CountDocuments(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err != nil {
+		return 0, fmt.Errorf("count workflow notifications: %w", err)
+	}
+	return count, nil
 }
 
 func (p *pipelineProbe) kafkaLag(ctx context.Context) (int64, error) {
@@ -431,19 +434,24 @@ func waitUntilPipelineComplete(
 	defer ticker.Stop()
 
 	var latest pipelineSnapshot
+	var lastProbeErr error
 	for {
-		snapshot, err := probe.Snapshot(ctx, workflowID)
-		if err != nil {
-			return latest, time.Since(started), err
-		}
-		latest = snapshot
-		if pipelineComplete(snapshot, baseline, expected) {
-			return snapshot, time.Since(started), nil
+		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		snapshot, err := probe.Snapshot(probeCtx, workflowID)
+		cancel()
+		if err == nil {
+			latest = snapshot
+			lastProbeErr = nil
+			if pipelineComplete(snapshot, baseline, expected) {
+				return snapshot, time.Since(started), nil
+			}
+		} else {
+			lastProbeErr = err
 		}
 
 		select {
 		case <-ctx.Done():
-			return latest, time.Since(started), fmt.Errorf(
+			message := fmt.Sprintf(
 				"timed out waiting for pipeline: records=%d/%d unpublished=%d notifications=%d/%d kafkaLag=%d",
 				latest.Records-baseline.Records,
 				expected,
@@ -452,6 +460,10 @@ func waitUntilPipelineComplete(
 				expected,
 				latest.KafkaLag,
 			)
+			if lastProbeErr != nil {
+				message += fmt.Sprintf(" lastProbeError=%v", lastProbeErr)
+			}
+			return latest, time.Since(started), errors.New(message)
 		case <-ticker.C:
 		}
 	}
