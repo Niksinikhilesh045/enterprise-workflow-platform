@@ -324,9 +324,18 @@ kafka lag:      0
 post-http drain: ...
 end-to-end:      ...
 e2e throughput:  ... records/s
+
+Pipeline stage timings
+http complete:          ...
+outbox fully published: ... (... after HTTP)
+kafka lag reached zero: ... (... after outbox)
+notifications complete: ... (... after HTTP)
+pipeline complete:      ...
 ```
 
 `end-to-end` starts when the record workload starts and stops only after the full asynchronous completion criteria are observed. `post-http drain` isolates the time between the final HTTP response and full pipeline catch-up.
+
+The stage timings are observation points sampled by the benchmark probe. In particular, `kafka lag reached zero` is only recorded after the outbox has first been observed fully published, so an earlier transient zero-lag reading cannot be mistaken for downstream completion.
 
 The benchmark defaults to the local `MONGO_URI`, `MONGO_DB`, `KAFKA_BROKERS`, topic `workflow.record-events`, and consumer group `workflow-notifications-v1`. Override them with flags when testing a different environment.
 
