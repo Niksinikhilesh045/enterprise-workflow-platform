@@ -97,6 +97,14 @@ The GitHub Actions backend workflow also runs MongoDB transaction integration te
 
 Frontend CI performs a production React build and strict React Native TypeScript checking. Infrastructure CI builds the Go container and runs Terraform formatting, provider initialization, and validation.
 
+## Validated local performance
+
+A Windows local validation run completed 5,000 authenticated transactional record submissions with 50 concurrent workers and zero HTTP failures. The same run measured 815.32 req/s API ingestion and 180.45 records/s end-to-end through the MongoDB transactional outbox, Kafka, and idempotent notification projection, with zero final consumer lag.
+
+The optimized outbox relay was observed fully published 544 ms after HTTP completion. These are local benchmark results, not production SLOs or cloud guarantees.
+
+See [docs/performance-validation.md](docs/performance-validation.md) for the exact test profile, stage timings, caveats, and reproducible command.
+
 ## AWS deployment status
 
 The repository contains CI-validated Terraform for an AWS deployment using ECS/Fargate, ALB, ECR, CloudWatch, Secrets Manager references, private S3, and CloudFront Origin Access Control.
