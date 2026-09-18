@@ -472,20 +472,7 @@ func waitUntilPipelineComplete(
 			latest = snapshot
 			lastProbeErr = nil
 			elapsed := time.Since(started)
-			recordsComplete := snapshot.Records-baseline.Records >= expected
-			notificationsComplete := snapshot.Notifications-baseline.Notifications >= expected
-
-			if milestones.OutboxPublished == 0 && recordsComplete && snapshot.Unpublished == 0 {
-				milestones.OutboxPublished = elapsed
-			}
-			if milestones.NotificationsComplete == 0 && notificationsComplete {
-				milestones.NotificationsComplete = elapsed
-			}
-			if milestones.KafkaCaughtUp == 0 &&
-				milestones.OutboxPublished > 0 &&
-				snapshot.KafkaLag == 0 {
-				milestones.KafkaCaughtUp = elapsed
-			}
+			observePipelineMilestones(&milestones, snapshot, baseline, expected, elapsed)
 
 			if pipelineComplete(snapshot, baseline, expected) {
 				milestones.EndToEnd = elapsed
@@ -513,6 +500,29 @@ func waitUntilPipelineComplete(
 			return latest, milestones, errors.New(message)
 		case <-ticker.C:
 		}
+	}
+}
+
+func observePipelineMilestones(
+	milestones *pipelineMilestones,
+	snapshot pipelineSnapshot,
+	baseline pipelineSnapshot,
+	expected int64,
+	elapsed time.Duration,
+) {
+	recordsComplete := snapshot.Records-baseline.Records >= expected
+	notificationsComplete := snapshot.Notifications-baseline.Notifications >= expected
+
+	if milestones.OutboxPublished == 0 && recordsComplete && snapshot.Unpublished == 0 {
+		milestones.OutboxPublished = elapsed
+	}
+	if milestones.NotificationsComplete == 0 && notificationsComplete {
+		milestones.NotificationsComplete = elapsed
+	}
+	if milestones.KafkaCaughtUp == 0 &&
+		milestones.OutboxPublished > 0 &&
+		snapshot.KafkaLag == 0 {
+		milestones.KafkaCaughtUp = elapsed
 	}
 }
 
